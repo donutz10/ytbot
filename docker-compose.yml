@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    # or, after the GitHub Action has run once:
+    # image: ghcr.io/YOUR_GITHUB_USERNAME/yt-music-bot:latest
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro   # optional, remove if unused
