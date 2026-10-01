@@ -2,6 +2,7 @@ require('dotenv').config();
 const { spawn, execFile } = require('node:child_process');
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, MessageFlags, PermissionFlagsBits, InteractionContextType,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
 } = require('discord.js');
 const {
   joinVoiceChannel, createAudioPlayer, createAudioResource, entersState, generateDependencyReport,
@@ -17,13 +18,89 @@ const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static') || 'ffmpeg';
 const IDLE_LEAVE_MS = 5 * 60 * 1000;   // leave after 5 min with nothing playing
 const ALONE_LEAVE_MS = 60 * 1000;      // leave after 1 min alone in the channel
 const MAX_PLAYLIST = 100;
+const COLORS = { now: 0xff0033, queue: 0x5865f2, file: 0x57f287, info: 0xfee75c };
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN. Copy .env.example to .env and fill it in.');
   process.exit(1);
 }
 
-// ---------- yt-dlp helpers ----------
+// ---------- formatting ----------
+const fmt = (s) => {
+  if (s == null) return 'unknown';
+  if (!s) return 'live';
+  s = Math.floor(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+};
+
+// "1:02:03" -> seconds; "LIVE"/missing -> 0
+const parseLength = (text) => {
+  const parts = String(text || '').split(':').map(Number);
+  if (!parts.length || parts.some(Number.isNaN)) return 0;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+};
+
+function progressBar(elapsed, total, size = 16) {
+  if (!total) return '🔴 **LIVE**';
+  const pos = Math.min(size - 1, Math.max(0, Math.round((elapsed / total) * (size - 1))));
+  return '▬'.repeat(pos) + '🔘' + '▬'.repeat(size - 1 - pos);
+}
+
+const link = (t) => `[${t.title.replace(/[[\]]/g, '')}](${t.url})`;
+
+// ---------- fast YouTube search (powers autocomplete) ----------
+const searchCache = new Map(); // query -> { at, results }
+const metaCache = new Map();   // video url -> track metadata (lets /play skip yt-dlp for picked results)
+
+async function ytSearch(query, limit = 10) {
+  const key = query.trim().toLowerCase();
+  const hit = searchCache.get(key);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.results.slice(0, limit);
+
+  const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0', 'accept-language': 'en-US,en;q=0.9' },
+    body: JSON.stringify({
+      context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+      query, params: 'EgIQAQ%3D%3D', // videos only
+    }),
+    signal: AbortSignal.timeout(2500),
+  });
+  if (!res.ok) throw new Error(`YouTube search failed (${res.status})`);
+  const data = await res.json();
+  const sections = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents ?? [];
+  const results = [];
+  for (const s of sections) {
+    for (const c of s.itemSectionRenderer?.contents ?? []) {
+      const v = c.videoRenderer;
+      if (!v?.videoId) continue;
+      results.push({
+        title: v.title?.runs?.map((r) => r.text).join('') || 'Unknown title',
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+        duration: parseLength(v.lengthText?.simpleText),
+        thumbnail: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        channel: v.ownerText?.runs?.[0]?.text || null,
+        views: v.shortViewCountText?.simpleText || null,
+      });
+    }
+  }
+  searchCache.set(key, { at: Date.now(), results });
+  for (const t of results) metaCache.set(t.url, t);
+  if (searchCache.size > 300) searchCache.delete(searchCache.keys().next().value);
+  if (metaCache.size > 3000) metaCache.delete(metaCache.keys().next().value);
+  return results.slice(0, limit);
+}
+
+function choiceName(t) {
+  const channel = (t.channel || '').slice(0, 24);
+  const tail = ` · ${channel} · ${fmt(t.duration)}`;
+  const room = 100 - tail.length;
+  const title = t.title.length > room ? `${t.title.slice(0, room - 1)}…` : t.title;
+  return title + tail;
+}
+
+// ---------- yt-dlp (links, playlists, fallback) ----------
 function ytArgs(args) {
   // node is used to solve YouTube's JS challenges (required by yt-dlp since late 2025)
   const base = ['--js-runtimes', 'node', '--no-warnings', '--no-playlist'];
@@ -31,7 +108,7 @@ function ytArgs(args) {
   return [...base, ...args];
 }
 
-function resolveTracks(query) {
+function ytdlpResolve(query) {
   const isUrl = /^https?:\/\//i.test(query);
   const target = isUrl ? query : `ytsearch1:${query}`;
   return new Promise((resolve, reject) => {
@@ -51,7 +128,8 @@ function resolveTracks(query) {
           title: e.title || 'Unknown title',
           url: e.webpage_url || (e.url?.startsWith('http') ? e.url : `https://www.youtube.com/watch?v=${e.id}`),
           duration: e.duration || 0,
-          thumbnail: e.thumbnail || e.thumbnails?.at(-1)?.url || null,
+          thumbnail: e.thumbnail || e.thumbnails?.at(-1)?.url || (e.id ? `https://i.ytimg.com/vi/${e.id}/hqdefault.jpg` : null),
+          channel: e.uploader || e.channel || null,
         }));
         resolve({ tracks, playlistTitle: isUrl && data._type === 'playlist' ? data.title : null });
       },
@@ -59,29 +137,114 @@ function resolveTracks(query) {
   });
 }
 
-// yt-dlp (best audio) -> ffmpeg -> Ogg/Opus, which Discord can play without re-encoding in JS
-function createStream(url) {
-  const yt = spawn(YTDLP, ytArgs(['-f', 'bestaudio/best', '-o', '-', '-v', url]));
+async function resolveTracks(query) {
+  const isUrl = /^https?:\/\//i.test(query);
+  if (isUrl && metaCache.has(query)) return { tracks: [{ ...metaCache.get(query) }], playlistTitle: null };
+  if (!isUrl) {
+    try {
+      const results = await ytSearch(query, 1);
+      if (results.length) return { tracks: [{ ...results[0] }], playlistTitle: null };
+    } catch (e) {
+      console.warn('Fast search failed, falling back to yt-dlp:', e.message);
+    }
+  }
+  return ytdlpResolve(query);
+}
+
+// ---------- attached audio files ----------
+const AUDIO_EXT = /\.(mp3|wav|flac|ogg|oga|opus|m4a|aac|wma|aiff?|webm|mp4|mkv|mov)$/i;
+
+function isAudioAttachment(att) {
+  const type = att.contentType || '';
+  return type.startsWith('audio/') || type.startsWith('video/') || AUDIO_EXT.test(att.name || '');
+}
+
+// Reads just the container header via ffmpeg to get the length; resolves undefined if unknown.
+function probeDuration(url) {
+  return new Promise((resolve) => {
+    execFile(FFMPEG, ['-hide_banner', '-i', url], { timeout: 15_000 }, (_err, _stdout, stderr) => {
+      const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(stderr || '');
+      resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : undefined);
+    });
+  });
+}
+
+// ---------- audio pipeline ----------
+// yt-dlp (best audio) -> ffmpeg -> Ogg/Opus, which Discord can play without re-encoding in JS.
+// Attached files skip yt-dlp: ffmpeg downloads the attachment URL itself.
+function createStream(track) {
+  const input = track.file
+    ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', track.url]
+    : ['-i', 'pipe:0'];
   const ff = spawn(FFMPEG, [
-    '-loglevel', 'error', '-i', 'pipe:0', '-vn',
+    '-loglevel', 'error', ...input, '-vn',
     '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2', '-f', 'ogg', 'pipe:1',
   ]);
-  yt.stdout.pipe(ff.stdin);
-  for (const s of [yt.stdout, ff.stdin, ff.stdout]) s.on('error', () => {});
-  yt.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString().trim()));
   ff.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
+  for (const s of [ff.stdin, ff.stdout]) s.on('error', () => {});
+
+  let yt = null;
+  if (!track.file) {
+    yt = spawn(YTDLP, ytArgs(['-f', 'bestaudio/best', '-o', '-', '-v', track.url]));
+    yt.stdout.on('error', () => {});
+    yt.stdout.pipe(ff.stdin);
+    yt.stderr.on('data', (d) => console.error('[yt-dlp]', d.toString().trim()));
+  }
   return {
     stream: ff.stdout,
-    kill: () => { yt.kill('SIGKILL'); ff.kill('SIGKILL'); },
+    kill: () => { yt?.kill('SIGKILL'); ff.kill('SIGKILL'); },
   };
 }
 
-const fmt = (s) => {
-  if (!s) return 'live';
-  s = Math.floor(s);
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = String(s % 60).padStart(2, '0');
-  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
-};
+// ---------- embeds & buttons ----------
+function controls(q, disabled = false) {
+  const paused = q.player.state.status === AudioPlayerStatus.Paused;
+  const btn = (id, emoji, label, style) =>
+    new ButtonBuilder().setCustomId(`ctl:${id}`).setEmoji(emoji).setLabel(label).setStyle(style).setDisabled(disabled);
+  return new ActionRowBuilder().addComponents(
+    btn('pause', paused ? '▶️' : '⏸️', paused ? 'Resume' : 'Pause', paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+    btn('skip', '⏭️', 'Skip', ButtonStyle.Primary),
+    btn('loop', '🔂', 'Loop', q.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+    btn('shuffle', '🔀', 'Shuffle', ButtonStyle.Secondary),
+    btn('stop', '⏹️', 'Stop', ButtonStyle.Danger),
+  );
+}
+
+function nowPlayingEmbed(q, track) {
+  const next = q.tracks[0];
+  const e = new EmbedBuilder()
+    .setColor(track.file ? COLORS.file : COLORS.now)
+    .setAuthor({ name: track.file ? '📎  Now playing · attached file' : '▶️  Now playing' })
+    .setTitle(track.title.slice(0, 256))
+    .setURL(track.url)
+    .addFields(
+      { name: '⏱️ Duration', value: fmt(track.duration), inline: true },
+      { name: '📺 Channel', value: (track.channel || (track.file ? 'Uploaded file' : '—')).slice(0, 64), inline: true },
+      { name: '⏭️ Up next', value: next ? `${next.title.slice(0, 48)}${q.tracks.length > 1 ? ` (+${q.tracks.length - 1})` : ''}` : 'Nothing · add with /play', inline: true },
+    )
+    .setFooter({ text: `Requested by ${track.requester.name}${q.loop ? '  •  🔂 loop on' : ''}`, iconURL: track.requester.avatar })
+    .setTimestamp();
+  if (track.thumbnail) e.setThumbnail(track.thumbnail);
+  return e;
+}
+
+function queuedEmbed(q, track, position) {
+  const ahead = q.tracks.slice(0, position - 1).reduce((s, t) => s + (t.duration || 0), 0)
+    + Math.max(0, (q.current?.duration || 0) - q.elapsed());
+  const e = new EmbedBuilder()
+    .setColor(track.file ? COLORS.file : COLORS.queue)
+    .setAuthor({ name: track.file ? '📎  Added file to queue' : '➕  Added to queue' })
+    .setTitle(track.title.slice(0, 256))
+    .setURL(track.url)
+    .addFields(
+      { name: '⏱️ Duration', value: fmt(track.duration), inline: true },
+      { name: '🔢 Position', value: `#${position}`, inline: true },
+      { name: '⌛ Plays in', value: `~${fmt(ahead)}`, inline: true },
+    )
+    .setFooter({ text: `Requested by ${track.requester.name}`, iconURL: track.requester.avatar });
+  if (track.thumbnail) e.setThumbnail(track.thumbnail);
+  return e;
+}
 
 // ---------- per-server queue ----------
 const queues = new Map();
@@ -98,6 +261,7 @@ class GuildQueue {
     this.skipping = false;
     this.idleTimer = null;
     this.aloneTimer = null;
+    this.panel = null; // the latest "Now playing" message (holds the live buttons)
 
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
     connection.subscribe(this.player);
@@ -127,11 +291,43 @@ class GuildQueue {
     this.text?.send(content).catch(() => {});
   }
 
+  elapsed() {
+    const r = this.player.state.resource;
+    return r ? r.playbackDuration / 1000 : 0;
+  }
+
+  paused() {
+    return this.player.state.status === AudioPlayerStatus.Paused;
+  }
+
+  queueDuration() {
+    return this.tracks.reduce((s, t) => s + (t.duration || 0), 0);
+  }
+
+  shuffle() {
+    for (let n = this.tracks.length - 1; n > 0; n--) {
+      const r = Math.floor(Math.random() * (n + 1));
+      [this.tracks[n], this.tracks[r]] = [this.tracks[r], this.tracks[n]];
+    }
+  }
+
+  // keep only one live control panel: strip the buttons from the previous one
+  retirePanel() {
+    const old = this.panel;
+    this.panel = null;
+    old?.edit({ components: [] }).catch(() => {});
+  }
+
+  refreshPanel() {
+    this.panel?.edit({ embeds: [nowPlayingEmbed(this, this.current)], components: [controls(this)] }).catch(() => {});
+  }
+
   next() {
     this.proc?.kill();
     this.proc = null;
     if (this.loop && this.current && !this.skipping) this.tracks.unshift(this.current);
     this.skipping = false;
+    this.retirePanel();
 
     const track = this.tracks.shift();
     if (!track) {
@@ -146,21 +342,12 @@ class GuildQueue {
 
     clearTimeout(this.idleTimer);
     this.current = track;
-    this.proc = createStream(track.url);
+    this.proc = createStream(track);
     this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus }));
 
-    const embed = new EmbedBuilder()
-      .setColor(0xff0000)
-      .setAuthor({ name: 'Now playing' })
-      .setTitle(track.title.slice(0, 256))
-      .setURL(track.url)
-      .addFields(
-        { name: 'Duration', value: fmt(track.duration), inline: true },
-        { name: 'Requested by', value: `<@${track.requestedBy}>`, inline: true },
-        { name: 'Up next', value: String(this.tracks.length), inline: true },
-      );
-    if (track.thumbnail) embed.setThumbnail(track.thumbnail);
-    this.text?.send({ embeds: [embed] }).catch(() => {});
+    this.text?.send({ embeds: [nowPlayingEmbed(this, track)], components: [controls(this)] })
+      .then((msg) => { if (this.current === track) this.panel = msg; else msg.edit({ components: [] }).catch(() => {}); })
+      .catch(() => {});
   }
 
   skip() {
@@ -174,6 +361,7 @@ class GuildQueue {
     clearTimeout(this.idleTimer);
     clearTimeout(this.aloneTimer);
     this.tracks = [];
+    this.retirePanel();
     this.proc?.kill();
     this.player.stop(true);
     try { this.connection.destroy(); } catch {}
@@ -204,7 +392,9 @@ async function getOrCreateQueue(interaction, voiceChannel) {
 // ---------- slash commands ----------
 const commands = [
   new SlashCommandBuilder().setName('play').setDescription('Play a song or playlist from YouTube')
-    .addStringOption((o) => o.setName('query').setDescription('Song name, YouTube link, or playlist link').setRequired(true)),
+    .addStringOption((o) => o.setName('query').setDescription('Start typing to see results · or paste a link').setRequired(true).setAutocomplete(true)),
+  new SlashCommandBuilder().setName('play-file').setDescription('Play an attached audio file')
+    .addAttachmentOption((o) => o.setName('file').setDescription('An audio file to play (mp3, wav, flac, ogg, m4a…)').setRequired(true)),
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
   new SlashCommandBuilder().setName('stop').setDescription('Stop, clear the queue and leave'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
@@ -233,13 +423,69 @@ client.once('clientReady', async () => {
 
 const eph = (content) => ({ content, flags: MessageFlags.Ephemeral });
 
+// ---------- autocomplete: live search results while typing ----------
+async function handleAutocomplete(i) {
+  const focused = i.options.getFocused(true);
+  const text = String(focused.value || '').trim();
+  const fallback = text.length <= 100 ? [{ name: `🔍 Search "${text}"`.slice(0, 100), value: text }] : [];
+  try {
+    if (i.commandName !== 'play' || focused.name !== 'query' || !text) return await i.respond([]);
+    if (/^https?:\/\//i.test(text)) {
+      return await i.respond(text.length <= 100 ? [{ name: `🔗 ${text}`.slice(0, 100), value: text }] : []);
+    }
+    const results = await ytSearch(text, 10);
+    const choices = results.map((t) => ({ name: choiceName(t), value: t.url }));
+    await i.respond(choices.length ? choices : fallback);
+  } catch (e) {
+    await i.respond(fallback).catch(() => {});
+  }
+}
+
+// ---------- buttons on the "Now playing" panel ----------
+async function handleButton(i) {
+  const q = queues.get(i.guildId);
+  if (!q || q.destroyed) {
+    await i.update({ components: [] }).catch(() => {});
+    return i.followUp(eph('Nothing is playing.')).catch(() => {});
+  }
+  if (i.member.voice?.channelId !== q.connection.joinConfig.channelId) {
+    return i.reply(eph('Join my voice channel to use the controls.'));
+  }
+  switch (i.customId.slice(4)) {
+    case 'pause':
+      if (q.paused()) q.player.unpause(); else q.player.pause();
+      return i.update({ components: [controls(q)] });
+    case 'loop':
+      q.loop = !q.loop;
+      return i.update({ embeds: [nowPlayingEmbed(q, q.current)], components: [controls(q)] });
+    case 'shuffle':
+      q.shuffle();
+      await i.update({ embeds: [nowPlayingEmbed(q, q.current)], components: [controls(q)] });
+      return i.followUp(eph(`🔀 Shuffled ${q.tracks.length} tracks.`)).catch(() => {});
+    case 'skip': {
+      const title = q.current?.title;
+      await i.update({ components: [controls(q, true)] });
+      q.skip();
+      return q.say(`⏭️ <@${i.user.id}> skipped **${title}**`);
+    }
+    case 'stop':
+      await i.update({ components: [] });
+      q.destroy();
+      return q.say(`⏹️ <@${i.user.id}> stopped the music.`);
+  }
+}
+
 client.on('interactionCreate', async (i) => {
-  if (!i.isChatInputCommand() || !i.inGuild()) return;
+  if (!i.inGuild()) return;
+  if (i.isAutocomplete()) return handleAutocomplete(i);
+  if (i.isButton() && i.customId.startsWith('ctl:')) return handleButton(i).catch((e) => console.error('Button error:', e));
+  if (!i.isChatInputCommand()) return;
+
   const q = queues.get(i.guildId);
   const vc = i.member.voice?.channel;
 
-  // everything except /queue and /nowplaying requires being in the bot's channel
-  const needsSameChannel = !['queue', 'nowplaying', 'play'].includes(i.commandName);
+  // everything except /queue, /nowplaying and the play commands requires being in the bot's channel
+  const needsSameChannel = !['queue', 'nowplaying', 'play', 'play-file'].includes(i.commandName);
   if (needsSameChannel) {
     if (!q) return i.reply(eph('Nothing is playing.'));
     if (vc?.id !== q.connection.joinConfig.channelId) return i.reply(eph('Join my voice channel first.'));
@@ -247,7 +493,8 @@ client.on('interactionCreate', async (i) => {
 
   try {
     switch (i.commandName) {
-      case 'play': {
+      case 'play':
+      case 'play-file': {
         if (!vc) return i.reply(eph('Join a voice channel first.'));
         if (q && q.connection.joinConfig.channelId !== vc.id) {
           return i.reply(eph(`I'm already playing in <#${q.connection.joinConfig.channelId}>.`));
@@ -256,59 +503,111 @@ client.on('interactionCreate', async (i) => {
         if (!perms?.has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
           return i.reply(eph("I don't have permission to connect/speak in that channel."));
         }
-        await i.deferReply();
-        const query = i.options.getString('query', true);
-        const { tracks, playlistTitle } = await resolveTracks(query);
+        let tracks = [];
+        let playlistTitle = null;
+        if (i.commandName === 'play-file') {
+          const file = i.options.getAttachment('file', true);
+          if (!isAudioAttachment(file)) return i.reply(eph("That doesn't look like an audio file (mp3, wav, flac, ogg, m4a…)."));
+          await i.deferReply();
+          tracks.push({
+            title: file.name.replace(AUDIO_EXT, ''),
+            url: file.url,
+            duration: await probeDuration(file.url),
+            thumbnail: null,
+            channel: null,
+            file: true,
+          });
+        } else {
+          await i.deferReply();
+          ({ tracks, playlistTitle } = await resolveTracks(i.options.getString('query', true)));
+        }
         if (!tracks.length) return i.editReply('🔍 Nothing found.');
-        tracks.forEach((t) => { t.requestedBy = i.user.id; });
+        const requester = { id: i.user.id, name: i.member.displayName ?? i.user.username, avatar: i.user.displayAvatarURL({ size: 64 }) };
+        tracks.forEach((t) => { t.requestedBy = i.user.id; t.requester = requester; });
 
         const queue = await getOrCreateQueue(i, vc);
         queue.text = i.channel;
         queue.tracks.push(...tracks);
         const wasIdle = !queue.current;
-        if (wasIdle) queue.next();
+        if (wasIdle) queue.next(); else queue.refreshPanel();
 
-        if (playlistTitle) return i.editReply(`📃 Added **${tracks.length}** songs from **${playlistTitle}**.`);
-        return i.editReply(wasIdle ? `▶️ Starting **${tracks[0].title}**` : `➕ Queued **${tracks[0].title}** (#${queue.tracks.length})`);
+        if (playlistTitle) {
+          return i.editReply({
+            embeds: [new EmbedBuilder().setColor(COLORS.queue)
+              .setAuthor({ name: '📃  Playlist added' })
+              .setTitle(playlistTitle.slice(0, 256))
+              .setDescription(`**${tracks.length}** songs · ${fmt(tracks.reduce((s, t) => s + (t.duration || 0), 0))} total`)
+              .setFooter({ text: `Requested by ${requester.name}`, iconURL: requester.avatar })],
+          });
+        }
+        if (wasIdle) return i.editReply(`▶️ Starting **${tracks[0].title}**`);
+        return i.editReply({ embeds: [queuedEmbed(queue, tracks[0], queue.tracks.length)] });
       }
-      case 'skip':
+      case 'skip': {
+        const title = q.current?.title;
         q.skip();
-        return i.reply('⏭️ Skipped.');
+        return i.reply(`⏭️ Skipped **${title}**.`);
+      }
       case 'stop':
         q.destroy();
         return i.reply('⏹️ Stopped and left the channel.');
       case 'pause':
         q.player.pause();
+        q.refreshPanel();
         return i.reply('⏸️ Paused.');
       case 'resume':
         q.player.unpause();
+        q.refreshPanel();
         return i.reply('▶️ Resumed.');
       case 'loop':
         q.loop = !q.loop;
+        q.refreshPanel();
         return i.reply(q.loop ? '🔂 Looping the current song.' : '➡️ Loop off.');
       case 'shuffle':
-        for (let n = q.tracks.length - 1; n > 0; n--) {
-          const r = Math.floor(Math.random() * (n + 1));
-          [q.tracks[n], q.tracks[r]] = [q.tracks[r], q.tracks[n]];
-        }
-        return i.reply('🔀 Shuffled.');
+        q.shuffle();
+        q.refreshPanel();
+        return i.reply(`🔀 Shuffled ${q.tracks.length} tracks.`);
       case 'remove': {
         const pos = i.options.getInteger('position', true);
         if (pos > q.tracks.length) return i.reply(eph(`There are only ${q.tracks.length} songs in the queue.`));
         const [removed] = q.tracks.splice(pos - 1, 1);
+        q.refreshPanel();
         return i.reply(`🗑️ Removed **${removed.title}**.`);
       }
-      case 'nowplaying':
+      case 'nowplaying': {
         if (!q?.current) return i.reply(eph('Nothing is playing.'));
-        return i.reply(`🎵 **${q.current.title}** (${fmt(q.current.duration)})${q.loop ? ' 🔂' : ''}\n${q.current.url}`);
+        const t = q.current;
+        const elapsed = q.elapsed();
+        const e = new EmbedBuilder()
+          .setColor(t.file ? COLORS.file : COLORS.now)
+          .setAuthor({ name: q.paused() ? '⏸️  Paused' : '🎵  Now playing' })
+          .setTitle(t.title.slice(0, 256))
+          .setURL(t.url)
+          .setDescription(`${progressBar(elapsed, t.duration)}\n\`${fmt(elapsed)} / ${fmt(t.duration)}\`${q.loop ? '  🔂' : ''}`)
+          .addFields(
+            { name: '📺 Channel', value: (t.channel || (t.file ? 'Uploaded file' : '—')).slice(0, 64), inline: true },
+            { name: '🙋 Requested by', value: `<@${t.requestedBy}>`, inline: true },
+            { name: '📋 Queue', value: `${q.tracks.length} track${q.tracks.length === 1 ? '' : 's'} · ${fmt(q.queueDuration())}`, inline: true },
+          );
+        if (t.thumbnail) e.setThumbnail(t.thumbnail);
+        return i.reply({ embeds: [e], components: [controls(q)] });
+      }
       case 'queue': {
         if (!q?.current) return i.reply(eph('The queue is empty.'));
-        const lines = q.tracks.slice(0, 10).map((t, n) => `\`${n + 1}.\` ${t.title} — ${fmt(t.duration)}`);
-        const more = q.tracks.length > 10 ? `\n…and ${q.tracks.length - 10} more` : '';
-        return i.reply({
-          embeds: [new EmbedBuilder().setColor(0xff0000).setTitle('Queue')
-            .setDescription(`**Now:** ${q.current.title}\n\n${lines.join('\n') || '_Nothing up next_'}${more}`.slice(0, 4000))],
-        });
+        const lines = q.tracks.slice(0, 10).map((t, n) =>
+          `\`${String(n + 1).padStart(2, '0')}\`  ${link(t)}  ·  \`${fmt(t.duration)}\`  ·  <@${t.requestedBy}>`);
+        const more = q.tracks.length > 10 ? `\n*…and ${q.tracks.length - 10} more*` : '';
+        const e = new EmbedBuilder()
+          .setColor(COLORS.queue)
+          .setAuthor({ name: '📋  Queue' })
+          .setDescription((
+            `**${q.paused() ? '⏸️' : '▶️'} Now:** ${link(q.current)}\n`
+            + `${progressBar(q.elapsed(), q.current.duration, 12)} \`${fmt(q.elapsed())} / ${fmt(q.current.duration)}\`\n\n`
+            + `${lines.join('\n') || '*Nothing up next — add more with /play*'}${more}`
+          ).slice(0, 4000))
+          .setFooter({ text: `${q.tracks.length} queued  •  ${fmt(q.queueDuration())} total  •  loop ${q.loop ? 'on' : 'off'}` });
+        if (q.current.thumbnail) e.setThumbnail(q.current.thumbnail);
+        return i.reply({ embeds: [e] });
       }
     }
   } catch (e) {
