@@ -14,6 +14,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID || null;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const COOKIES = process.env.YTDLP_COOKIES || null;
+const POT_PROVIDER_URL = process.env.POT_PROVIDER_URL || null; // bgutil PO-token server, see docker-compose.yml
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static') || 'ffmpeg';
 const IDLE_LEAVE_MS = 5 * 60 * 1000;   // leave after 5 min with nothing playing
 const ALONE_LEAVE_MS = 60 * 1000;      // leave after 1 min alone in the channel
@@ -105,6 +106,7 @@ function ytArgs(args) {
   // node is used to solve YouTube's JS challenges (required by yt-dlp since late 2025)
   const base = ['--js-runtimes', 'node', '--no-warnings', '--no-playlist'];
   if (COOKIES) base.push('--cookies', COOKIES);
+  if (POT_PROVIDER_URL) base.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_PROVIDER_URL}`);
   return [...base, ...args];
 }
 

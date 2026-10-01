@@ -4,6 +4,17 @@ services:
     # or, after the GitHub Action has run once:
     # image: ghcr.io/YOUR_GITHUB_USERNAME/yt-music-bot:latest
     env_file: .env
+    environment:
+      # yt-dlp asks this sidecar for YouTube "PO tokens"; needed on cloud/datacenter IPs alongside cookies
+      POT_PROVIDER_URL: http://bgutil:4416
     restart: unless-stopped
+    depends_on:
+      - bgutil
     volumes:
       - ./cookies.txt:/app/cookies.txt:ro   # optional, remove if unused
+
+  # PO-token generator (https://github.com/Brainicism/bgutil-ytdlp-pot-provider). Not exposed outside Docker.
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    init: true
+    restart: unless-stopped
