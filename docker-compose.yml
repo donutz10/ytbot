@@ -11,7 +11,7 @@ services:
     depends_on:
       - bgutil
     volumes:
-      - ./cookies.txt:/app/cookies.txt:ro   # optional, remove if unused
+      - ./cookies.txt:/app/cookies.txt   # optional, remove if unused. Writable: yt-dlp saves refreshed cookies back
 
   # PO-token generator (https://github.com/Brainicism/bgutil-ytdlp-pot-provider). Not exposed outside Docker.
   bgutil:
