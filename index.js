@@ -1,5 +1,7 @@
 require('dotenv').config();
 const { spawn, execFile } = require('node:child_process');
+const { promisify } = require('node:util');
+const execFileP = promisify(execFile);
 const {
   Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, MessageFlags, PermissionFlagsBits, InteractionContextType,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
@@ -171,22 +173,74 @@ function probeDuration(url) {
   });
 }
 
+// ---------- direct stream URL prefetch ----------
+// yt-dlp's extraction (webpage, player JS, PO token) is the slow part (3-5 s). We do it ahead of time -
+// while the user is still looking at the search dropdown, or while a track waits in the queue - and
+// store the direct audio URL on the track, so at play time ffmpeg can open it immediately.
+const DIRECT_TTL_MS = 4 * 60 * 60 * 1000; // YouTube media URLs expire after ~6 h
+
+function prefetchStream(track) {
+  if (!track || track.file) return Promise.resolve(null);
+  if (track.direct && Date.now() - track.direct.at < DIRECT_TTL_MS) return track.direct.promise;
+  const promise = (async () => {
+    const t0 = Date.now();
+    const { stdout } = await execFileP(
+      YTDLP,
+      ytArgs(['-f', 'bestaudio[acodec=opus]/bestaudio/best', '--print', '%(urls)s\n|||%(acodec)s|||%(http_headers)j', track.url]),
+      { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const [urlPart, acodec, headersJson] = stdout.split('|||');
+    const url = urlPart.trim().split('\n')[0];
+    if (!/^https?:\/\//.test(url)) throw new Error('no direct url');
+    const headers = JSON.parse(headersJson.trim());
+    // make sure the URL is actually fetchable from this IP before trusting it at play time
+    const res = await fetch(url, { headers: { ...headers, Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(8_000) });
+    await res.body?.cancel();
+    if (res.status !== 206 && res.status !== 200) throw new Error(`direct url returned HTTP ${res.status}`);
+    console.log(`[prefetch] ${track.title} ready in ${Date.now() - t0} ms (${acodec.trim()})`);
+    return { url, opus: acodec.trim() === 'opus', headers };
+  })().catch((e) => {
+    console.warn(`[prefetch] ${track.title}: ${e.message.split('\n')[0]} - will stream via yt-dlp instead`);
+    track.direct = null;
+    return null;
+  });
+  track.direct = { at: Date.now(), promise };
+  return promise;
+}
+
+// debounce per user: prefetch the top search result once they pause typing (they usually pick it)
+const autocompletePrefetch = new Map();
+function schedulePrefetch(userId, track) {
+  clearTimeout(autocompletePrefetch.get(userId));
+  autocompletePrefetch.set(userId, setTimeout(() => {
+    autocompletePrefetch.delete(userId);
+    prefetchStream(track);
+  }, 600));
+}
+
 // ---------- audio pipeline ----------
-// yt-dlp (best audio) -> ffmpeg -> Ogg/Opus, which Discord can play without re-encoding in JS.
-// Attached files skip yt-dlp: ffmpeg downloads the attachment URL itself.
-function createStream(track) {
-  const input = track.file
-    ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', track.url]
-    : ['-i', 'pipe:0'];
-  const ff = spawn(FFMPEG, [
-    '-loglevel', 'error', ...input, '-vn',
-    '-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2', '-f', 'ogg', 'pipe:1',
-  ]);
+// Source -> ffmpeg -> Ogg/Opus, which Discord can play without re-encoding in JS.
+//   prefetched direct URL : ffmpeg reads it straight from YouTube (instant start; opus is remuxed, not re-encoded)
+//   attached file         : ffmpeg downloads the attachment URL itself
+//   fallback              : yt-dlp (best audio) piped into ffmpeg
+function createStream(track, direct) {
+  const reconnect = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+  let input;
+  if (track.file) input = [...reconnect, '-i', track.url];
+  else if (direct) {
+    const hdrs = Object.entries(direct.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n';
+    input = [...reconnect, '-headers', hdrs, '-i', direct.url];
+  } else input = ['-i', 'pipe:0'];
+  const encode = direct?.opus && !track.file
+    ? ['-c:a', 'copy']
+    : ['-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2'];
+
+  const ff = spawn(FFMPEG, ['-loglevel', 'error', ...input, '-vn', ...encode, '-f', 'ogg', 'pipe:1']);
   ff.stderr.on('data', (d) => console.error('[ffmpeg]', d.toString().trim()));
   for (const s of [ff.stdin, ff.stdout]) s.on('error', () => {});
 
   let yt = null;
-  if (!track.file) {
+  if (!track.file && !direct) {
     yt = spawn(YTDLP, ytArgs(['-f', 'bestaudio/best', '-o', '-', '-v', track.url]));
     yt.stdout.on('error', () => {});
     yt.stdout.pipe(ff.stdin);
@@ -321,10 +375,16 @@ class GuildQueue {
   }
 
   refreshPanel() {
+    this.primeNext();
     this.panel?.edit({ embeds: [nowPlayingEmbed(this, this.current)], components: [controls(this)] }).catch(() => {});
   }
 
-  next() {
+  // resolve the upcoming track's stream URL in the background so skips and transitions are instant
+  primeNext() {
+    prefetchStream(this.tracks[0]);
+  }
+
+  async next() {
     this.proc?.kill();
     this.proc = null;
     if (this.loop && this.current && !this.skipping) this.tracks.unshift(this.current);
@@ -334,6 +394,7 @@ class GuildQueue {
     const track = this.tracks.shift();
     if (!track) {
       this.current = null;
+      this.loading = null;
       clearTimeout(this.idleTimer);
       this.idleTimer = setTimeout(() => {
         this.say('👋 Nothing playing for a while — leaving the channel.');
@@ -344,8 +405,14 @@ class GuildQueue {
 
     clearTimeout(this.idleTimer);
     this.current = track;
-    this.proc = createStream(track);
+    const token = (this.loading = {});
+    const direct = await prefetchStream(track); // instant if already prefetched
+    if (this.loading !== token || this.destroyed) return; // skipped/stopped while resolving
+    this.loading = null;
+
+    this.proc = createStream(track, direct);
     this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus }));
+    this.primeNext();
 
     this.text?.send({ embeds: [nowPlayingEmbed(this, track)], components: [controls(this)] })
       .then((msg) => { if (this.current === track) this.panel = msg; else msg.edit({ components: [] }).catch(() => {}); })
@@ -354,6 +421,7 @@ class GuildQueue {
 
   skip() {
     this.skipping = true;
+    if (this.loading) { this.loading = null; return this.next(); } // still resolving: move on directly
     this.player.stop(true); // triggers Idle -> next()
   }
 
@@ -438,6 +506,7 @@ async function handleAutocomplete(i) {
     const results = await ytSearch(text, 10);
     const choices = results.map((t) => ({ name: choiceName(t), value: t.url }));
     await i.respond(choices.length ? choices : fallback);
+    if (results.length) schedulePrefetch(i.user.id, results[0]);
   } catch (e) {
     await i.respond(fallback).catch(() => {});
   }
@@ -505,12 +574,17 @@ client.on('interactionCreate', async (i) => {
         if (!perms?.has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
           return i.reply(eph("I don't have permission to connect/speak in that channel."));
         }
+        const file = i.commandName === 'play-file' ? i.options.getAttachment('file', true) : null;
+        if (file && !isAudioAttachment(file)) return i.reply(eph("That doesn't look like an audio file (mp3, wav, flac, ogg, m4a…)."));
+        await i.deferReply();
+
+        // join the voice channel while the track is being resolved, not after
+        const joining = q ? Promise.resolve(q) : getOrCreateQueue(i, vc);
+        joining.catch(() => {});
+
         let tracks = [];
         let playlistTitle = null;
-        if (i.commandName === 'play-file') {
-          const file = i.options.getAttachment('file', true);
-          if (!isAudioAttachment(file)) return i.reply(eph("That doesn't look like an audio file (mp3, wav, flac, ogg, m4a…)."));
-          await i.deferReply();
+        if (file) {
           tracks.push({
             title: file.name.replace(AUDIO_EXT, ''),
             url: file.url,
@@ -520,14 +594,14 @@ client.on('interactionCreate', async (i) => {
             file: true,
           });
         } else {
-          await i.deferReply();
           ({ tracks, playlistTitle } = await resolveTracks(i.options.getString('query', true)));
         }
         if (!tracks.length) return i.editReply('🔍 Nothing found.');
+        prefetchStream(tracks[0]); // start resolving the stream URL now, overlapping with the voice join
         const requester = { id: i.user.id, name: i.member.displayName ?? i.user.username, avatar: i.user.displayAvatarURL({ size: 64 }) };
         tracks.forEach((t) => { t.requestedBy = i.user.id; t.requester = requester; });
 
-        const queue = await getOrCreateQueue(i, vc);
+        const queue = await joining;
         queue.text = i.channel;
         queue.tracks.push(...tracks);
         const wasIdle = !queue.current;
