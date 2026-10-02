@@ -17,7 +17,10 @@ const GUILD_ID = process.env.GUILD_ID || null;
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const COOKIES = process.env.YTDLP_COOKIES || null;
 const POT_PROVIDER_URL = process.env.POT_PROVIDER_URL || null; // bgutil PO-token server, see docker-compose.yml
-const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static') || 'ffmpeg';
+// prefer a system ffmpeg: the npm ffmpeg-static build can't fetch from YouTube's media servers
+const FFMPEG = process.env.FFMPEG_PATH
+  || ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg'].find((p) => require('node:fs').existsSync(p))
+  || require('ffmpeg-static') || 'ffmpeg';
 const IDLE_LEAVE_MS = 5 * 60 * 1000;   // leave after 5 min with nothing playing
 const ALONE_LEAVE_MS = 60 * 1000;      // leave after 1 min alone in the channel
 const MAX_PLAYLIST = 100;
@@ -468,7 +471,10 @@ class GuildQueue {
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
     connection.subscribe(this.player);
 
-    this.player.on(AudioPlayerStatus.Idle, () => this.next());
+    this.gotAudio = false;   // did the current stream deliver any audio yet?
+    this.watchdog = null;
+    this.player.on('stateChange', (_o, n) => { if (n.status === AudioPlayerStatus.Playing) this.gotAudio = true; });
+    this.player.on(AudioPlayerStatus.Idle, () => this.onIdle());
     this.player.on('error', (e) => {
       console.error('Player error:', e.message);
       this.say(`⚠️ Couldn't play **${this.current?.title ?? 'track'}**, skipping.`);
@@ -549,6 +555,42 @@ class GuildQueue {
     prefetchStream(this.tracks[0]);
   }
 
+  play(track, direct, seek = 0) {
+    const old = this.proc;
+    this.proc = createStream(track, direct, seek);
+    this.direct = direct;
+    this.offset = seek;
+    this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus })); // replaces any old resource, no Idle fired
+    old?.kill();
+    this.armWatchdog();
+  }
+
+  // if a stream delivers no audio within a few seconds, retry through yt-dlp (direct URL) or give up (pipe)
+  armWatchdog() {
+    clearTimeout(this.watchdog);
+    this.gotAudio = false;
+    this.watchdog = setTimeout(() => {
+      if (!this.current || this.gotAudio || this.destroyed || this.loading) return;
+      if (this.direct) return this.fallback('no audio after 8 s');
+      this.say(`⚠️ Couldn't play **${this.current.title}**, skipping.`);
+      this.dropCurrent = true;
+      this.skip();
+    }, 8_000);
+  }
+
+  fallback(reason) {
+    const t = this.current;
+    console.warn(`[stream] ${t.title}: ${reason} - retrying via yt-dlp pipe`);
+    t.direct = null; // forget the bad URL
+    this.play(t, null, Math.floor(this.offset));
+  }
+
+  onIdle() {
+    // a direct stream that ended before producing any audio (403, stall) -> retry via yt-dlp, don't skip
+    if (this.current && this.direct && !this.gotAudio && !this.skipping && !this.loading) return this.fallback('stream ended without audio');
+    this.next();
+  }
+
   async next() {
     this.proc?.kill();
     this.proc = null;
@@ -581,9 +623,7 @@ class GuildQueue {
     if (this.loading !== token || this.destroyed) return; // skipped/stopped while resolving
     this.loading = null;
 
-    this.direct = direct;
-    this.proc = createStream(track, direct);
-    this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus }));
+    this.play(track, direct);
     this.primeNext();
 
     this.text?.send({ embeds: [nowPlayingEmbed(this)], components: controls(this) })
@@ -600,12 +640,7 @@ class GuildQueue {
     seconds = Math.max(0, Math.min(Math.floor(seconds), Math.floor(t.duration) - 1));
     const direct = t.file ? null : await prefetchStream(t);
     if (this.current !== t || this.destroyed) return seconds;
-    const old = this.proc;
-    this.proc = createStream(t, direct, seconds);
-    this.direct = direct;
-    this.offset = seconds;
-    this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus })); // replaces the old resource, no Idle fired
-    old?.kill();
+    this.play(t, direct, seconds);
     return seconds;
   }
 
@@ -619,6 +654,7 @@ class GuildQueue {
     if (this.destroyed) return;
     this.destroyed = true;
     clearInterval(this.ticker);
+    clearTimeout(this.watchdog);
     clearTimeout(this.idleTimer);
     clearTimeout(this.aloneTimer);
     this.tracks = [];

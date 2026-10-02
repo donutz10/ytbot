@@ -7,6 +7,10 @@ services:
     environment:
       # yt-dlp asks this sidecar for YouTube "PO tokens"; needed on cloud/datacenter IPs alongside cookies
       POT_PROVIDER_URL: http://bgutil:4416
+      # the system binaries from the image, even if .env has empty FFMPEG_PATH= / YTDLP_PATH= lines
+      # (the npm ffmpeg-static build cannot fetch from YouTube's media servers)
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      YTDLP_PATH: /usr/local/bin/yt-dlp
     restart: unless-stopped
     depends_on:
       - bgutil
