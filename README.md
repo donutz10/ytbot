@@ -4,9 +4,9 @@ A small, self-hosted YouTube music bot for Discord. Slash commands, per-server q
 Built on discord.js v14 + @discordjs/voice (with DAVE end-to-end voice encryption, which Discord requires since March 2026) and yt-dlp for YouTube.
 
 ## Commands
-`/play <song name | link | playlist link>` · `/play-file <attached mp3/wav/flac/ogg/m4a>` · `/skip` · `/stop` · `/pause` · `/resume` · `/queue` · `/nowplaying` · `/loop` · `/shuffle` · `/remove <position>`
+`/play <song name | link | playlist link>` · `/play-file <attached mp3/wav/flac/ogg/m4a>` · `/seek <1:30 | 90 | +30 | -15>` · `/skip` · `/stop` · `/pause` · `/resume` · `/queue [page]` · `/nowplaying` · `/loop [off|track|queue]` · `/shuffle` · `/remove <position>`
 
-`/play` shows live YouTube search results as you type — pick one and it starts instantly. Every "Now playing" message has Pause / Skip / Loop / Shuffle / Stop buttons, and `/nowplaying` shows a progress bar.
+`/play` shows live YouTube search results as you type and resolves the top ones in the background, so a pick starts instantly. The player panel has a live progress bar, big artwork, and buttons for pause, skip, loop (off → track → queue), shuffle, stop, ⏪/⏩ 10 s seek, the queue and the video link. `/queue` is paginated.
 
 ## 1. Create the Discord bot
 1. Go to https://discord.com/developers/applications → **New Application**.

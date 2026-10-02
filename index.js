@@ -44,10 +44,25 @@ const parseLength = (text) => {
   return parts.reduce((acc, n) => acc * 60 + n, 0);
 };
 
-function progressBar(elapsed, total, size = 16) {
+function progressBar(elapsed, total, size = 14) {
   if (!total) return '🔴 **LIVE**';
   const pos = Math.min(size - 1, Math.max(0, Math.round((elapsed / total) * (size - 1))));
-  return '▬'.repeat(pos) + '🔘' + '▬'.repeat(size - 1 - pos);
+  return '━'.repeat(pos) + '⬤' + '─'.repeat(size - 1 - pos);
+}
+
+// "1:30", "90", "2m10s", "+30", "-15" -> absolute seconds (NaN if unparseable)
+function parseSeekTarget(text, current) {
+  const s = String(text).trim().replace(/\s+/g, '').toLowerCase();
+  const rel = /^([+-])(.+)$/.exec(s);
+  const body = rel ? rel[2] : s;
+  let secs;
+  if (/^\d+(:\d{1,2}){1,2}$/.test(body)) secs = parseLength(body);
+  else if (/^\d+$/.test(body)) secs = Number(body);
+  else if (/^(\d+h)?(\d+m)?(\d+s)?$/.test(body) && body) {
+    const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(body);
+    secs = (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0);
+  } else return NaN;
+  return rel ? (rel[1] === '+' ? current + secs : current - secs) : secs;
 }
 
 const link = (t) => `[${t.title.replace(/[[\]]/g, '')}](${t.url})`;
@@ -253,14 +268,16 @@ function placeholderTrack(url) {
 //   prefetched direct URL : ffmpeg reads it straight from YouTube (instant start; opus is remuxed, not re-encoded)
 //   attached file         : ffmpeg downloads the attachment URL itself
 //   fallback              : yt-dlp (best audio) piped into ffmpeg
-function createStream(track, direct) {
-  const reconnect = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+// `seek` (seconds) uses HTTP range requests on direct URLs/files; on the piped fallback ffmpeg decodes and discards.
+function createStream(track, direct, seek = 0) {
+  const reconnect = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']; // http(s) inputs only
+  const ss = seek > 0 ? ['-ss', String(seek)] : [];
   let input;
-  if (track.file) input = [...reconnect, '-i', track.url];
+  if (track.file) input = [...(/^https?:/i.test(track.url) ? reconnect : []), ...ss, '-i', track.url];
   else if (direct) {
     const hdrs = Object.entries(direct.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n';
-    input = [...reconnect, '-headers', hdrs, '-i', direct.url];
-  } else input = ['-i', 'pipe:0'];
+    input = [...reconnect, '-headers', hdrs, ...ss, '-i', direct.url];
+  } else input = ['-i', 'pipe:0', ...ss];
   const encode = direct?.opus && !track.file
     ? ['-c:a', 'copy']
     : ['-c:a', 'libopus', '-b:a', '128k', '-ar', '48000', '-ac', '2'];
@@ -282,35 +299,70 @@ function createStream(track, direct) {
   };
 }
 
-// ---------- embeds & buttons ----------
-function controls(q, disabled = false) {
-  const paused = q.player.state.status === AudioPlayerStatus.Paused;
-  const btn = (id, emoji, label, style) =>
-    new ButtonBuilder().setCustomId(`ctl:${id}`).setEmoji(emoji).setLabel(label).setStyle(style).setDisabled(disabled);
-  return new ActionRowBuilder().addComponents(
-    btn('pause', paused ? '▶️' : '⏸️', paused ? 'Resume' : 'Pause', paused ? ButtonStyle.Success : ButtonStyle.Secondary),
-    btn('skip', '⏭️', 'Skip', ButtonStyle.Primary),
-    btn('loop', '🔂', 'Loop', q.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
-    btn('shuffle', '🔀', 'Shuffle', ButtonStyle.Secondary),
-    btn('stop', '⏹️', 'Stop', ButtonStyle.Danger),
-  );
+// ---------- look & feel ----------
+const LOOP = {
+  off: { emoji: '➡️', label: 'Loop off', next: 'track' },
+  track: { emoji: '🔂', label: 'Loop track', next: 'queue' },
+  queue: { emoji: '🔁', label: 'Loop queue', next: 'off' },
+};
+const SEEK_STEP = 10;
+const QUEUE_PAGE = 10;
+const PANEL_TICK_MS = 15_000; // live progress refresh on the player panel
+
+function hslToInt(h, s, l) {
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const [r, g, b] = [f(0), f(8), f(4)].map((x) => Math.round(x * 255));
+  return (r << 16) | (g << 8) | b;
 }
 
-function nowPlayingEmbed(q, track) {
-  const next = q.tracks[0];
+// every track gets its own vivid accent colour, stable across messages
+function trackColor(track) {
+  if (track.file) return COLORS.file;
+  let h = 0;
+  for (const ch of track.url) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return hslToInt(h % 360, 0.82, 0.56);
+}
+
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+function statusLine(q) {
+  const t = q.current;
+  const parts = [q.paused() ? '⏸️ Paused' : '▶️ Playing'];
+  if (q.loop !== 'off') parts.push(`${LOOP[q.loop].emoji} ${LOOP[q.loop].label}`);
+  parts.push(t.file ? '📎 Attached file' : q.direct?.opus ? '🎧 Opus · direct' : '🎧 Opus');
+  return parts.join('  ·  ');
+}
+
+function timeline(q) {
+  const t = q.current;
+  const el = q.elapsed();
+  return t.duration
+    ? `\`${fmt(el)}\` ${progressBar(el, t.duration)} \`${fmt(t.duration)}\``
+    : `\`${fmt(el)}\` ${progressBar(el, 0)}`;
+}
+
+function nowPlayingEmbed(q) {
+  const t = q.current;
+  const upNext = q.tracks.slice(0, 3)
+    .map((x, n) => `\`${n + 1}\`  ${clip(x.title, 42)}  ·  \`${fmt(x.duration)}\``)
+    .join('\n');
   const e = new EmbedBuilder()
-    .setColor(track.file ? COLORS.file : COLORS.now)
-    .setAuthor({ name: track.file ? '📎  Now playing · attached file' : '▶️  Now playing' })
-    .setTitle(track.title.slice(0, 256))
-    .setURL(track.url)
+    .setColor(trackColor(t))
+    .setAuthor({ name: t.file ? 'NOW PLAYING  ·  ATTACHED FILE' : 'NOW PLAYING', iconURL: t.requester.avatar })
+    .setTitle(t.title.slice(0, 256))
+    .setURL(t.url)
+    .setDescription(`${timeline(q)}\n${statusLine(q)}`)
     .addFields(
-      { name: '⏱️ Duration', value: fmt(track.duration), inline: true },
-      { name: '📺 Channel', value: (track.channel || (track.file ? 'Uploaded file' : '—')).slice(0, 64), inline: true },
-      { name: '⏭️ Up next', value: next ? `${next.title.slice(0, 48)}${q.tracks.length > 1 ? ` (+${q.tracks.length - 1})` : ''}` : 'Nothing · add with /play', inline: true },
+      { name: '📺 Channel', value: clip(t.channel || (t.file ? 'Uploaded by requester' : '—'), 40), inline: true },
+      { name: '🙋 Requested by', value: `<@${t.requestedBy}>`, inline: true },
+      { name: '📋 Queue', value: q.tracks.length ? `${q.tracks.length} track${q.tracks.length === 1 ? '' : 's'}  ·  ${fmt(q.queueDuration())}` : 'empty', inline: true },
+      { name: `⏭️ Up next${q.tracks.length > 3 ? `  (+${q.tracks.length - 3} more)` : ''}`, value: upNext || '*Nothing — add more with /play*' },
     )
-    .setFooter({ text: `Requested by ${track.requester.name}${q.loop ? '  •  🔂 loop on' : ''}`, iconURL: track.requester.avatar })
+    .setFooter({ text: `⏪ ⏩ seek ${SEEK_STEP}s  ·  /seek 1:30  ·  loop cycles off → track → queue` })
     .setTimestamp();
-  if (track.thumbnail) e.setThumbnail(track.thumbnail);
+  if (t.thumbnail) e.setImage(t.thumbnail);
   return e;
 }
 
@@ -318,18 +370,77 @@ function queuedEmbed(q, track, position) {
   const ahead = q.tracks.slice(0, position - 1).reduce((s, t) => s + (t.duration || 0), 0)
     + Math.max(0, (q.current?.duration || 0) - q.elapsed());
   const e = new EmbedBuilder()
-    .setColor(track.file ? COLORS.file : COLORS.queue)
-    .setAuthor({ name: track.file ? '📎  Added file to queue' : '➕  Added to queue' })
+    .setColor(trackColor(track))
+    .setAuthor({ name: track.file ? 'ADDED TO QUEUE  ·  ATTACHED FILE' : 'ADDED TO QUEUE', iconURL: track.requester.avatar })
     .setTitle(track.title.slice(0, 256))
     .setURL(track.url)
     .addFields(
       { name: '⏱️ Duration', value: fmt(track.duration), inline: true },
       { name: '🔢 Position', value: `#${position}`, inline: true },
       { name: '⌛ Plays in', value: `~${fmt(ahead)}`, inline: true },
-    )
-    .setFooter({ text: `Requested by ${track.requester.name}`, iconURL: track.requester.avatar });
+    );
   if (track.thumbnail) e.setThumbnail(track.thumbnail);
   return e;
+}
+
+function playlistEmbed(title, tracks, requester) {
+  return new EmbedBuilder()
+    .setColor(COLORS.queue)
+    .setAuthor({ name: 'PLAYLIST ADDED', iconURL: requester.avatar })
+    .setTitle(title.slice(0, 256))
+    .setDescription(`**${tracks.length}** songs  ·  ${fmt(tracks.reduce((s, t) => s + (t.duration || 0), 0))} total\n\n`
+      + tracks.slice(0, 5).map((t, n) => `\`${n + 1}\`  ${clip(t.title, 48)}`).join('\n')
+      + (tracks.length > 5 ? `\n*…and ${tracks.length - 5} more*` : ''))
+    .setThumbnail(tracks[0]?.thumbnail ?? null);
+}
+
+function queueEmbed(q, page = 0) {
+  const pages = Math.max(1, Math.ceil(q.tracks.length / QUEUE_PAGE));
+  page = Math.min(Math.max(0, page), pages - 1);
+  const start = page * QUEUE_PAGE;
+  const lines = q.tracks.slice(start, start + QUEUE_PAGE).map((t, n) =>
+    `\`${String(start + n + 1).padStart(2, '0')}\`  ${link({ ...t, title: clip(t.title, 50) })}  ·  \`${fmt(t.duration)}\`  ·  <@${t.requestedBy}>`);
+  const e = new EmbedBuilder()
+    .setColor(trackColor(q.current))
+    .setAuthor({ name: 'QUEUE' })
+    .setDescription((
+      `**${q.paused() ? '⏸️' : '▶️'} Now:** ${link(q.current)}\n${timeline(q)}\n\n`
+      + (lines.join('\n') || '*Nothing up next — add more with /play*')
+    ).slice(0, 4000))
+    .setFooter({ text: `Page ${page + 1}/${pages}  ·  ${q.tracks.length} queued  ·  ${fmt(q.queueDuration())} total  ·  ${LOOP[q.loop].label.toLowerCase()}` });
+  if (q.current.thumbnail) e.setThumbnail(q.current.thumbnail);
+  return { embed: e, page, pages };
+}
+
+function queueButtons(page, pages) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`q:${page - 1}`).setEmoji('◀️').setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+    new ButtonBuilder().setCustomId('q:noop').setLabel(`${page + 1} / ${pages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`q:${page + 1}`).setEmoji('▶️').setStyle(ButtonStyle.Secondary).setDisabled(page >= pages - 1),
+    new ButtonBuilder().setCustomId(`q:${page}`).setEmoji('🔄').setLabel('Refresh').setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function controls(q, disabled = false) {
+  const paused = q.paused();
+  const canSeek = Boolean(q.current?.duration);
+  const btn = (id, emoji, label, style, off = disabled) =>
+    new ButtonBuilder().setCustomId(`ctl:${id}`).setEmoji(emoji).setLabel(label).setStyle(style).setDisabled(off);
+  return [
+    new ActionRowBuilder().addComponents(
+      btn('pause', paused ? '▶️' : '⏸️', paused ? 'Resume' : 'Pause', paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+      btn('skip', '⏭️', 'Skip', ButtonStyle.Primary),
+      btn('loop', LOOP[q.loop].emoji, LOOP[q.loop].label, q.loop === 'off' ? ButtonStyle.Secondary : ButtonStyle.Success),
+      btn('shuffle', '🔀', 'Shuffle', ButtonStyle.Secondary),
+      btn('stop', '⏹️', 'Stop', ButtonStyle.Danger),
+    ),
+    new ActionRowBuilder().addComponents(
+      btn('back', '⏪', `${SEEK_STEP}s`, ButtonStyle.Secondary, disabled || !canSeek),
+      btn('fwd', '⏩', `${SEEK_STEP}s`, ButtonStyle.Secondary, disabled || !canSeek),
+      btn('queue', '📋', 'Queue', ButtonStyle.Secondary),
+      new ButtonBuilder().setEmoji('🔗').setLabel(q.current?.file ? 'File' : 'YouTube').setStyle(ButtonStyle.Link).setURL(q.current?.url ?? 'https://youtube.com'),
+    ),
+  ];
 }
 
 // ---------- per-server queue ----------
@@ -342,12 +453,17 @@ class GuildQueue {
     this.text = textChannel;
     this.tracks = [];
     this.current = null;
-    this.loop = false;
+    this.loop = 'off';       // off | track | queue
     this.proc = null;
+    this.direct = null;      // stream info of the current track (null = yt-dlp pipe)
+    this.offset = 0;         // seconds the current stream started at (after a seek)
     this.skipping = false;
+    this.dropCurrent = false;
+    this.loading = null;
     this.idleTimer = null;
     this.aloneTimer = null;
-    this.panel = null; // the latest "Now playing" message (holds the live buttons)
+    this.panel = null;       // the latest "Now playing" message (holds the live buttons)
+    this.ticker = setInterval(() => this.tick(), PANEL_TICK_MS);
 
     this.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
     connection.subscribe(this.player);
@@ -356,7 +472,7 @@ class GuildQueue {
     this.player.on('error', (e) => {
       console.error('Player error:', e.message);
       this.say(`⚠️ Couldn't play **${this.current?.title ?? 'track'}**, skipping.`);
-      this.skipping = true; // don't loop a broken track
+      this.dropCurrent = true; // don't loop a broken track
     });
 
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -379,7 +495,7 @@ class GuildQueue {
 
   elapsed() {
     const r = this.player.state.resource;
-    return r ? r.playbackDuration / 1000 : 0;
+    return this.offset + (r ? r.playbackDuration / 1000 : 0);
   }
 
   paused() {
@@ -397,6 +513,11 @@ class GuildQueue {
     }
   }
 
+  cycleLoop(mode) {
+    this.loop = mode && LOOP[mode] ? mode : LOOP[this.loop].next;
+    return this.loop;
+  }
+
   // keep only one live control panel: strip the buttons from the previous one
   retirePanel() {
     const old = this.panel;
@@ -404,9 +525,23 @@ class GuildQueue {
     old?.edit({ components: [] }).catch(() => {});
   }
 
+  adoptPanel(msg) {
+    this.retirePanel();
+    this.panel = msg;
+  }
+
   refreshPanel() {
     this.primeNext();
-    this.panel?.edit({ embeds: [nowPlayingEmbed(this, this.current)], components: [controls(this)] }).catch(() => {});
+    if (this.current && this.panel) {
+      this.panel.edit({ embeds: [nowPlayingEmbed(this)], components: controls(this) }).catch(() => {});
+    }
+  }
+
+  // live progress bar on the panel
+  tick() {
+    if (this.current && !this.loading && !this.paused() && this.panel) {
+      this.panel.edit({ embeds: [nowPlayingEmbed(this)] }).catch(() => {});
+    }
   }
 
   // resolve the upcoming track's stream URL in the background so skips and transitions are instant
@@ -417,8 +552,14 @@ class GuildQueue {
   async next() {
     this.proc?.kill();
     this.proc = null;
-    if (this.loop && this.current && !this.skipping) this.tracks.unshift(this.current);
+    if (this.current && !this.dropCurrent) {
+      if (this.loop === 'track' && !this.skipping) this.tracks.unshift(this.current);
+      else if (this.loop === 'queue') this.tracks.push(this.current);
+    }
     this.skipping = false;
+    this.dropCurrent = false;
+    this.offset = 0;
+    this.direct = null;
     this.retirePanel();
 
     const track = this.tracks.shift();
@@ -440,13 +581,32 @@ class GuildQueue {
     if (this.loading !== token || this.destroyed) return; // skipped/stopped while resolving
     this.loading = null;
 
+    this.direct = direct;
     this.proc = createStream(track, direct);
     this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus }));
     this.primeNext();
 
-    this.text?.send({ embeds: [nowPlayingEmbed(this, track)], components: [controls(this)] })
+    this.text?.send({ embeds: [nowPlayingEmbed(this)], components: controls(this) })
       .then((msg) => { if (this.current === track) this.panel = msg; else msg.edit({ components: [] }).catch(() => {}); })
       .catch(() => {});
+  }
+
+  // jump to an absolute position (seconds) in the current track; returns the clamped position
+  async seek(seconds) {
+    const t = this.current;
+    if (!t || this.loading) throw new Error('Nothing is playing yet.');
+    if (!t.duration) throw new Error("Can't seek in a live stream.");
+    if (!Number.isFinite(seconds)) throw new Error('Give me a time like `1:30`, `90`, `+30` or `-15`.');
+    seconds = Math.max(0, Math.min(Math.floor(seconds), Math.floor(t.duration) - 1));
+    const direct = t.file ? null : await prefetchStream(t);
+    if (this.current !== t || this.destroyed) return seconds;
+    const old = this.proc;
+    this.proc = createStream(t, direct, seconds);
+    this.direct = direct;
+    this.offset = seconds;
+    this.player.play(createAudioResource(this.proc.stream, { inputType: StreamType.OggOpus })); // replaces the old resource, no Idle fired
+    old?.kill();
+    return seconds;
   }
 
   skip() {
@@ -458,6 +618,7 @@ class GuildQueue {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    clearInterval(this.ticker);
     clearTimeout(this.idleTimer);
     clearTimeout(this.aloneTimer);
     this.tracks = [];
@@ -495,13 +656,18 @@ const commands = [
     .addStringOption((o) => o.setName('query').setDescription('Start typing to see results · or paste a link').setRequired(true).setAutocomplete(true)),
   new SlashCommandBuilder().setName('play-file').setDescription('Play an attached audio file')
     .addAttachmentOption((o) => o.setName('file').setDescription('An audio file to play (mp3, wav, flac, ogg, m4a…)').setRequired(true)),
+  new SlashCommandBuilder().setName('seek').setDescription('Jump to a position in the current song')
+    .addStringOption((o) => o.setName('to').setDescription('1:30 · 90 · 2m10s · +30 · -15').setRequired(true)),
   new SlashCommandBuilder().setName('skip').setDescription('Skip the current song'),
   new SlashCommandBuilder().setName('stop').setDescription('Stop, clear the queue and leave'),
   new SlashCommandBuilder().setName('pause').setDescription('Pause playback'),
   new SlashCommandBuilder().setName('resume').setDescription('Resume playback'),
-  new SlashCommandBuilder().setName('queue').setDescription('Show the queue'),
-  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the current song'),
-  new SlashCommandBuilder().setName('loop').setDescription('Toggle looping the current song'),
+  new SlashCommandBuilder().setName('queue').setDescription('Show the queue')
+    .addIntegerOption((o) => o.setName('page').setDescription('Page number').setMinValue(1)),
+  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the player panel'),
+  new SlashCommandBuilder().setName('loop').setDescription('Loop the current song or the whole queue')
+    .addStringOption((o) => o.setName('mode').setDescription('Leave empty to cycle')
+      .addChoices({ name: 'off', value: 'off' }, { name: 'track', value: 'track' }, { name: 'queue', value: 'queue' })),
   new SlashCommandBuilder().setName('shuffle').setDescription('Shuffle the queue'),
   new SlashCommandBuilder().setName('remove').setDescription('Remove a song from the queue')
     .addIntegerOption((o) => o.setName('position').setDescription('Position in /queue').setRequired(true).setMinValue(1)),
@@ -545,30 +711,46 @@ async function handleAutocomplete(i) {
   }
 }
 
-// ---------- buttons on the "Now playing" panel ----------
+// ---------- buttons on the player panel and the queue ----------
 async function handleButton(i) {
   const q = queues.get(i.guildId);
-  if (!q || q.destroyed) {
+  if (!q || q.destroyed || !q.current) {
     await i.update({ components: [] }).catch(() => {});
     return i.followUp(eph('Nothing is playing.')).catch(() => {});
+  }
+  if (i.customId.startsWith('q:')) { // queue pagination - anyone may browse
+    const { embed, page, pages } = queueEmbed(q, Number(i.customId.slice(2)) || 0);
+    return i.update({ embeds: [embed], components: [queueButtons(page, pages)] });
   }
   if (i.member.voice?.channelId !== q.connection.joinConfig.channelId) {
     return i.reply(eph('Join my voice channel to use the controls.'));
   }
+  const panel = () => ({ embeds: [nowPlayingEmbed(q)], components: controls(q) });
   switch (i.customId.slice(4)) {
     case 'pause':
       if (q.paused()) q.player.unpause(); else q.player.pause();
-      return i.update({ components: [controls(q)] });
+      return i.update(panel());
     case 'loop':
-      q.loop = !q.loop;
-      return i.update({ embeds: [nowPlayingEmbed(q, q.current)], components: [controls(q)] });
+      q.cycleLoop();
+      return i.update(panel());
     case 'shuffle':
       q.shuffle();
-      await i.update({ embeds: [nowPlayingEmbed(q, q.current)], components: [controls(q)] });
+      q.primeNext();
+      await i.update(panel());
       return i.followUp(eph(`🔀 Shuffled ${q.tracks.length} tracks.`)).catch(() => {});
+    case 'back':
+    case 'fwd': {
+      await i.deferUpdate();
+      await q.seek(q.elapsed() + (i.customId.endsWith('fwd') ? SEEK_STEP : -SEEK_STEP));
+      return i.editReply(panel()).catch(() => {});
+    }
+    case 'queue': {
+      const { embed, page, pages } = queueEmbed(q, 0);
+      return i.reply({ embeds: [embed], components: [queueButtons(page, pages)], flags: MessageFlags.Ephemeral });
+    }
     case 'skip': {
       const title = q.current?.title;
-      await i.update({ components: [controls(q, true)] });
+      await i.update({ components: controls(q, true) });
       q.skip();
       return q.say(`⏭️ <@${i.user.id}> skipped **${title}**`);
     }
@@ -582,7 +764,12 @@ async function handleButton(i) {
 client.on('interactionCreate', async (i) => {
   if (!i.inGuild()) return;
   if (i.isAutocomplete()) return handleAutocomplete(i);
-  if (i.isButton() && i.customId.startsWith('ctl:')) return handleButton(i).catch((e) => console.error('Button error:', e));
+  if (i.isButton() && (i.customId.startsWith('ctl:') || i.customId.startsWith('q:'))) {
+    return handleButton(i).catch((e) => {
+      console.error('Button error:', e);
+      i.followUp(eph(`❌ ${e.message}`)).catch(() => {});
+    });
+  }
   if (!i.isChatInputCommand()) return;
 
   const q = queues.get(i.guildId);
@@ -640,17 +827,16 @@ client.on('interactionCreate', async (i) => {
         const wasIdle = !queue.current;
         if (wasIdle) queue.next(); else queue.refreshPanel();
 
-        if (playlistTitle) {
-          return i.editReply({
-            embeds: [new EmbedBuilder().setColor(COLORS.queue)
-              .setAuthor({ name: '📃  Playlist added' })
-              .setTitle(playlistTitle.slice(0, 256))
-              .setDescription(`**${tracks.length}** songs · ${fmt(tracks.reduce((s, t) => s + (t.duration || 0), 0))} total`)
-              .setFooter({ text: `Requested by ${requester.name}`, iconURL: requester.avatar })],
-          });
-        }
-        if (wasIdle) return i.editReply(`▶️ Starting **${tracks[0].title}**`);
+        if (playlistTitle) return i.editReply({ embeds: [playlistEmbed(playlistTitle, tracks, requester)] });
+        if (wasIdle) return i.editReply(`${tracks[0].direct ? '⚡' : '▶️'} Starting **${tracks[0].title}**`);
         return i.editReply({ embeds: [queuedEmbed(queue, tracks[0], queue.tracks.length)] });
+      }
+      case 'seek': {
+        const target = parseSeekTarget(i.options.getString('to', true), q.elapsed());
+        await i.deferReply();
+        const pos = await q.seek(target);
+        q.refreshPanel();
+        return i.editReply(`⏩ Jumped to \`${fmt(pos)}\` / \`${fmt(q.current.duration)}\``);
       }
       case 'skip': {
         const title = q.current?.title;
@@ -668,10 +854,11 @@ client.on('interactionCreate', async (i) => {
         q.player.unpause();
         q.refreshPanel();
         return i.reply('▶️ Resumed.');
-      case 'loop':
-        q.loop = !q.loop;
+      case 'loop': {
+        const mode = q.cycleLoop(i.options.getString('mode'));
         q.refreshPanel();
-        return i.reply(q.loop ? '🔂 Looping the current song.' : '➡️ Loop off.');
+        return i.reply(`${LOOP[mode].emoji} ${LOOP[mode].label}.`);
+      }
       case 'shuffle':
         q.shuffle();
         q.refreshPanel();
@@ -685,38 +872,14 @@ client.on('interactionCreate', async (i) => {
       }
       case 'nowplaying': {
         if (!q?.current) return i.reply(eph('Nothing is playing.'));
-        const t = q.current;
-        const elapsed = q.elapsed();
-        const e = new EmbedBuilder()
-          .setColor(t.file ? COLORS.file : COLORS.now)
-          .setAuthor({ name: q.paused() ? '⏸️  Paused' : '🎵  Now playing' })
-          .setTitle(t.title.slice(0, 256))
-          .setURL(t.url)
-          .setDescription(`${progressBar(elapsed, t.duration)}\n\`${fmt(elapsed)} / ${fmt(t.duration)}\`${q.loop ? '  🔂' : ''}`)
-          .addFields(
-            { name: '📺 Channel', value: (t.channel || (t.file ? 'Uploaded file' : '—')).slice(0, 64), inline: true },
-            { name: '🙋 Requested by', value: `<@${t.requestedBy}>`, inline: true },
-            { name: '📋 Queue', value: `${q.tracks.length} track${q.tracks.length === 1 ? '' : 's'} · ${fmt(q.queueDuration())}`, inline: true },
-          );
-        if (t.thumbnail) e.setThumbnail(t.thumbnail);
-        return i.reply({ embeds: [e], components: [controls(q)] });
+        await i.reply({ embeds: [nowPlayingEmbed(q)], components: controls(q) });
+        q.adoptPanel(await i.fetchReply()); // this message becomes the live panel
+        return;
       }
       case 'queue': {
         if (!q?.current) return i.reply(eph('The queue is empty.'));
-        const lines = q.tracks.slice(0, 10).map((t, n) =>
-          `\`${String(n + 1).padStart(2, '0')}\`  ${link(t)}  ·  \`${fmt(t.duration)}\`  ·  <@${t.requestedBy}>`);
-        const more = q.tracks.length > 10 ? `\n*…and ${q.tracks.length - 10} more*` : '';
-        const e = new EmbedBuilder()
-          .setColor(COLORS.queue)
-          .setAuthor({ name: '📋  Queue' })
-          .setDescription((
-            `**${q.paused() ? '⏸️' : '▶️'} Now:** ${link(q.current)}\n`
-            + `${progressBar(q.elapsed(), q.current.duration, 12)} \`${fmt(q.elapsed())} / ${fmt(q.current.duration)}\`\n\n`
-            + `${lines.join('\n') || '*Nothing up next — add more with /play*'}${more}`
-          ).slice(0, 4000))
-          .setFooter({ text: `${q.tracks.length} queued  •  ${fmt(q.queueDuration())} total  •  loop ${q.loop ? 'on' : 'off'}` });
-        if (q.current.thumbnail) e.setThumbnail(q.current.thumbnail);
-        return i.reply({ embeds: [e] });
+        const { embed, page, pages } = queueEmbed(q, (i.options.getInteger('page') ?? 1) - 1);
+        return i.reply({ embeds: [embed], components: [queueButtons(page, pages)] });
       }
     }
   } catch (e) {
