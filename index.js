@@ -143,7 +143,11 @@ function ytdlpResolve(query) {
 
 async function resolveTracks(query) {
   const isUrl = /^https?:\/\//i.test(query);
-  if (isUrl && metaCache.has(query)) return { tracks: [{ ...metaCache.get(query) }], playlistTitle: null };
+  if (isUrl && metaCache.has(query)) {
+    const meta = metaCache.get(query);
+    if (meta.placeholder && meta.direct) await meta.direct.promise; // prefetch in flight: it fills in title/duration
+    if (!meta.placeholder) return { tracks: [{ ...meta }], playlistTitle: null };
+  }
   if (!isUrl) {
     try {
       const results = await ytSearch(query, 1);
@@ -186,13 +190,23 @@ function prefetchStream(track) {
     const t0 = Date.now();
     const { stdout } = await execFileP(
       YTDLP,
-      ytArgs(['-f', 'bestaudio[acodec=opus]/bestaudio/best', '--print', '%(urls)s\n|||%(acodec)s|||%(http_headers)j', track.url]),
+      ytArgs(['-f', 'bestaudio[acodec=opus]/bestaudio/best', '--print',
+        '%(title)s|||%(duration)s|||%(uploader)s|||%(id)s|||%(acodec)s|||%(http_headers)j|||%(urls)s', track.url]),
       { timeout: 60_000, maxBuffer: 4 * 1024 * 1024 },
     );
-    const [urlPart, acodec, headersJson] = stdout.split('|||');
+    const [title, duration, uploader, id, acodec, headersJson, urlPart] = stdout.split('|||');
     const url = urlPart.trim().split('\n')[0];
     if (!/^https?:\/\//.test(url)) throw new Error('no direct url');
     const headers = JSON.parse(headersJson.trim());
+    if (track.placeholder) { // pasted link: we only knew the URL until now
+      Object.assign(track, {
+        title: title.trim() || track.url,
+        duration: Number(duration) || 0,
+        channel: uploader.trim() === 'NA' ? null : uploader.trim(),
+        thumbnail: /^[\w-]{11}$/.test(id.trim()) ? `https://i.ytimg.com/vi/${id.trim()}/hqdefault.jpg` : null,
+      });
+      delete track.placeholder;
+    }
     // make sure the URL is actually fetchable from this IP before trusting it at play time
     const res = await fetch(url, { headers: { ...headers, Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(8_000) });
     await res.body?.cancel();
@@ -208,14 +222,30 @@ function prefetchStream(track) {
   return promise;
 }
 
-// debounce per user: prefetch the top search result once they pause typing (they usually pick it)
+// debounce per user: once they pause typing, prefetch the top results (they almost always pick one of those)
+const PREFETCH_TOP = 3;
 const autocompletePrefetch = new Map();
-function schedulePrefetch(userId, track) {
+function schedulePrefetch(userId, tracks) {
   clearTimeout(autocompletePrefetch.get(userId));
-  autocompletePrefetch.set(userId, setTimeout(() => {
+  autocompletePrefetch.set(userId, setTimeout(async () => {
     autocompletePrefetch.delete(userId);
-    prefetchStream(track);
-  }, 600));
+    for (const t of tracks.slice(0, PREFETCH_TOP)) {
+      prefetchStream(t);
+      await new Promise((r) => setTimeout(r, 300)); // stagger so the first pick is ready soonest
+    }
+  }, 500));
+}
+
+// a pasted single-video link: remember it so it can be prefetched before the user even presses Enter
+const SINGLE_VIDEO = /^https?:\/\/(?:(?:www\.|m\.|music\.)?youtube\.com\/watch\?(?:[^#]*&)?v=[\w-]{11}|youtu\.be\/[\w-]{11})/i;
+function placeholderTrack(url) {
+  if (!SINGLE_VIDEO.test(url) || /[?&]list=/.test(url)) return null;
+  let t = metaCache.get(url);
+  if (!t) {
+    t = { title: url, url, duration: undefined, thumbnail: null, channel: null, placeholder: true };
+    metaCache.set(url, t);
+  }
+  return t;
 }
 
 // ---------- audio pipeline ----------
@@ -501,12 +531,15 @@ async function handleAutocomplete(i) {
   try {
     if (i.commandName !== 'play' || focused.name !== 'query' || !text) return await i.respond([]);
     if (/^https?:\/\//i.test(text)) {
-      return await i.respond(text.length <= 100 ? [{ name: `🔗 ${text}`.slice(0, 100), value: text }] : []);
+      await i.respond(text.length <= 100 ? [{ name: `🔗 ${text}`.slice(0, 100), value: text }] : []);
+      const t = placeholderTrack(text);
+      if (t) schedulePrefetch(i.user.id, [t]);
+      return;
     }
     const results = await ytSearch(text, 10);
     const choices = results.map((t) => ({ name: choiceName(t), value: t.url }));
     await i.respond(choices.length ? choices : fallback);
-    if (results.length) schedulePrefetch(i.user.id, results[0]);
+    if (results.length) schedulePrefetch(i.user.id, results);
   } catch (e) {
     await i.respond(fallback).catch(() => {});
   }
