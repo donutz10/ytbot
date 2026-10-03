@@ -226,9 +226,16 @@ function prefetchStream(track) {
       delete track.placeholder;
     }
     // make sure the URL is actually fetchable from this IP before trusting it at play time
-    const res = await fetch(url, { headers: { ...headers, Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(8_000) });
-    await res.body?.cancel();
-    if (res.status !== 206 && res.status !== 200) throw new Error(`direct url returned HTTP ${res.status}`);
+    // (YouTube answers 403 intermittently right after a burst of lookups; one retry usually clears it)
+    let status;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 2_000));
+      const res = await fetch(url, { headers: { ...headers, Range: 'bytes=0-1023' }, signal: AbortSignal.timeout(8_000) });
+      await res.body?.cancel();
+      status = res.status;
+      if (status === 206 || status === 200) break;
+    }
+    if (status !== 206 && status !== 200) throw new Error(`direct url returned HTTP ${status}`);
     console.log(`[prefetch] ${track.title} ready in ${Date.now() - t0} ms (${acodec.trim()})`);
     return { url, opus: acodec.trim() === 'opus', headers };
   })().catch((e) => {
@@ -249,7 +256,7 @@ function schedulePrefetch(userId, tracks) {
     autocompletePrefetch.delete(userId);
     for (const t of tracks.slice(0, PREFETCH_TOP)) {
       prefetchStream(t);
-      await new Promise((r) => setTimeout(r, 300)); // stagger so the first pick is ready soonest
+      await new Promise((r) => setTimeout(r, 800)); // stagger: first pick ready soonest, and no burst that trips YouTube's 403s
     }
   }, 500));
 }
@@ -298,6 +305,7 @@ function createStream(track, direct, seek = 0) {
   }
   return {
     stream: ff.stdout,
+    yt, // null on the direct/file paths
     kill: () => { yt?.kill('SIGKILL'); ff.kill('SIGKILL'); },
   };
 }
@@ -310,7 +318,9 @@ const LOOP = {
 };
 const SEEK_STEP = 10;
 const QUEUE_PAGE = 10;
-const PANEL_TICK_MS = 15_000; // live progress refresh on the player panel
+const PANEL_TICK_MS = 15_000;     // live progress refresh on the player panel
+const DIRECT_TIMEOUT_MS = 8_000;  // direct stream silent this long -> retry via yt-dlp
+const PIPE_TIMEOUT_MS = 60_000;   // yt-dlp pipe silent this long -> skip (extraction + YouTube's imposed wait can take 10-15 s)
 
 function hslToInt(h, s, l) {
   const k = (n) => (n + h / 30) % 12;
@@ -565,17 +575,25 @@ class GuildQueue {
     this.armWatchdog();
   }
 
-  // if a stream delivers no audio within a few seconds, retry through yt-dlp (direct URL) or give up (pipe)
+  // No audio yet after a while? A direct stream gets retried through yt-dlp; the yt-dlp pipe itself gets
+  // much longer (extraction + the wait YouTube imposes) but fails fast if yt-dlp exits with an error.
   armWatchdog() {
     clearTimeout(this.watchdog);
     this.gotAudio = false;
-    this.watchdog = setTimeout(() => {
-      if (!this.current || this.gotAudio || this.destroyed || this.loading) return;
-      if (this.direct) return this.fallback('no audio after 8 s');
+    const proc = this.proc;
+    const giveUp = (why) => {
+      if (this.proc !== proc || !this.current || this.gotAudio || this.destroyed || this.loading) return;
+      console.warn(`[stream] ${this.current.title}: ${why} - skipping`);
       this.say(`⚠️ Couldn't play **${this.current.title}**, skipping.`);
       this.dropCurrent = true;
       this.skip();
-    }, 8_000);
+    };
+    this.watchdog = setTimeout(() => {
+      if (this.proc !== proc || !this.current || this.gotAudio || this.destroyed || this.loading) return;
+      if (this.direct) return this.fallback(`no audio after ${DIRECT_TIMEOUT_MS / 1000} s`);
+      giveUp(`no audio after ${PIPE_TIMEOUT_MS / 1000} s`);
+    }, this.direct ? DIRECT_TIMEOUT_MS : PIPE_TIMEOUT_MS);
+    proc.yt?.once('close', (code) => { if (code) giveUp(`yt-dlp exited with code ${code}`); });
   }
 
   fallback(reason) {
